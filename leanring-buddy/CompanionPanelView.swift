@@ -31,6 +31,9 @@ struct CompanionPanelView: View {
 
                 modelPickerRow
                     .padding(.horizontal, 16)
+
+                ttsProviderPickerRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -607,8 +610,9 @@ struct CompanionPanelView: View {
             Spacer()
 
             HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                ForEach(AIModelConfig.availableChatModels) { chatModel in
+                    modelOptionButton(label: chatModel.label, modelID: chatModel.modelID)
+                }
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -628,6 +632,52 @@ struct CompanionPanelView: View {
             companionManager.setSelectedModel(modelID)
         }) {
             Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - TTS Provider Picker
+
+    private var ttsProviderPickerRow: some View {
+        HStack {
+            Text("Voice")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            HStack(spacing: 0) {
+                ForEach(AIModelConfig.TTSProvider.allCases) { provider in
+                    ttsProviderOptionButton(provider: provider)
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func ttsProviderOptionButton(provider: AIModelConfig.TTSProvider) -> some View {
+        let isSelected = companionManager.selectedTTSProvider == provider
+        return Button(action: {
+            companionManager.setSelectedTTSProvider(provider)
+        }) {
+            Text(provider.displayLabel)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
                 .padding(.horizontal, 10)

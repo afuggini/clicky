@@ -70,15 +70,50 @@ final class CompanionManager: ObservableObject {
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    private static let workerBaseURL = "http://localhost:8787"
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
 
-    private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+    private lazy var openAITTSClient: OpenAITTSClient = {
+        return OpenAITTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
+
+    private let appleTTSClient = AppleTTSClient()
+
+    // MARK: - TTS Provider Routing
+
+    /// Enqueues text for TTS playback using the currently selected provider.
+    private func ttsEnqueueText(_ text: String) async throws {
+        switch selectedTTSProvider {
+        case .openAI:
+            try await openAITTSClient.enqueueText(text)
+        case .apple:
+            appleTTSClient.enqueueText(text)
+        }
+    }
+
+    /// Stops any in-progress TTS playback and clears the queue.
+    private func ttsStopPlayback() {
+        openAITTSClient.stopPlayback()
+        appleTTSClient.stopPlayback()
+    }
+
+    /// Waits until all queued TTS audio has finished playing.
+    private func ttsWaitUntilFinished() async {
+        switch selectedTTSProvider {
+        case .openAI:
+            await openAITTSClient.waitUntilFinished()
+        case .apple:
+            await appleTTSClient.waitUntilFinished()
+        }
+    }
+
+    /// Whether any TTS audio is currently playing.
+    private var ttsIsPlaying: Bool {
+        openAITTSClient.isPlaying || appleTTSClient.isPlaying
+    }
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
@@ -93,6 +128,9 @@ final class CompanionManager: ObservableObject {
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    /// Screenshot capture started at key-release time so it runs in parallel
+    /// with transcription finalization. Awaited inside the response pipeline.
+    private var prefetchedScreenCaptureTask: Task<[CompanionScreenCapture], Error>?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
@@ -107,13 +145,24 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    /// The chat model used for voice responses. Persisted to UserDefaults.
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? AIModelConfig.defaultChatModelID
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = model
+    }
+
+    /// The TTS provider used for spoken responses. Persisted to UserDefaults.
+    @Published var selectedTTSProvider: AIModelConfig.TTSProvider = {
+        let stored = UserDefaults.standard.string(forKey: "selectedTTSProvider")
+        return stored.flatMap(AIModelConfig.TTSProvider.init(rawValue:)) ?? AIModelConfig.defaultTTSProvider
+    }()
+
+    func setSelectedTTSProvider(_ provider: AIModelConfig.TTSProvider) {
+        selectedTTSProvider = provider
+        UserDefaults.standard.set(provider.rawValue, forKey: "selectedTTSProvider")
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -493,7 +542,7 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            elevenLabsTTSClient.stopPlayback()
+            ttsStopPlayback()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -533,6 +582,14 @@ final class CompanionManager: ObservableObject {
             ClickyAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
+
+            // Start capturing screenshots now, in parallel with transcription
+            // finalization. By the time the transcript callback fires, the
+            // screenshot is usually already ready.
+            prefetchedScreenCaptureTask = Task {
+                try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            }
+
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
         case .none:
             break
@@ -579,21 +636,29 @@ final class CompanionManager: ObservableObject {
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
+    /// and plays the response aloud via OpenAI TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
-        elevenLabsTTSClient.stopPlayback()
+        ttsStopPlayback()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
-                // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                // Use the screenshot capture that was started at key-release time
+                // (in parallel with transcription). Falls back to a fresh capture
+                // if no prefetch is available (e.g. non-keyboard input paths).
+                let screenCaptures: [CompanionScreenCapture]
+                if let prefetchTask = prefetchedScreenCaptureTask {
+                    prefetchedScreenCaptureTask = nil
+                    screenCaptures = try await prefetchTask.value
+                } else {
+                    screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                }
 
                 guard !Task.isCancelled else { return }
 
@@ -610,23 +675,95 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
+                // Track sentences already dispatched to TTS so we can fire
+                // TTS requests as soon as each sentence boundary arrives in the
+                // stream, rather than waiting for the full response.
+                var sentenceAlreadySentToTTSCount = 0
+                var ttsFetchTasks: [Task<Void, Never>] = []
+
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { [weak self] accumulatedText in
+                        guard let self, !Task.isCancelled else { return }
+
+                        // Strip [POINT:...] tags before splitting into sentences
+                        // so the tag doesn't get spoken aloud.
+                        let textForSpeaking = Self.parsePointingCoordinates(from: accumulatedText).spokenText
+                        let completeSentences = Self.extractCompleteSentences(from: textForSpeaking)
+
+                        // Fire a TTS request for each new sentence we haven't
+                        // dispatched yet. The TTS client queues them for
+                        // back-to-back playback.
+                        while sentenceAlreadySentToTTSCount < completeSentences.count {
+                            let sentence = completeSentences[sentenceAlreadySentToTTSCount]
+                            sentenceAlreadySentToTTSCount += 1
+
+                            let trimmedSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmedSentence.isEmpty else { continue }
+
+                            // Switch to responding on the first sentence so the
+                            // user sees the state change immediately.
+                            if self.voiceState == .processing {
+                                self.voiceState = .responding
+                            }
+
+                            let ttsTask = Task {
+                                do {
+                                    try await self.ttsEnqueueText(trimmedSentence)
+                                } catch {
+                                    if !Task.isCancelled {
+                                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+                                        print("⚠️ OpenAI TTS error: \(error)")
+                                    }
+                                }
+                            }
+                            ttsFetchTasks.append(ttsTask)
+                        }
                     }
                 )
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
+                // Parse the full response for pointing coordinates and any
+                // remaining text that didn't end with sentence punctuation.
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
+                // Send any remaining tail text (after the last sentence boundary)
+                // to TTS. For example, if the response ends with "...click that"
+                // (no period), this catches it.
+                let alreadySentSentences = Self.extractCompleteSentences(from: spokenText)
+                let alreadySentText = alreadySentSentences.joined()
+                let remainingText = String(spokenText.dropFirst(alreadySentText.count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if !remainingText.isEmpty {
+                    if voiceState == .processing {
+                        voiceState = .responding
+                    }
+                    let ttsTask = Task {
+                        do {
+                            try await ttsEnqueueText(remainingText)
+                        } catch {
+                            if !Task.isCancelled {
+                                ClickyAnalytics.trackTTSError(error: error.localizedDescription)
+                                print("⚠️ OpenAI TTS error: \(error)")
+                            }
+                        }
+                    }
+                    ttsFetchTasks.append(ttsTask)
+                }
+
+                // Wait for all TTS fetch tasks to complete (they may still be
+                // downloading audio from the API while earlier chunks play).
+                for ttsTask in ttsFetchTasks {
+                    await ttsTask.value
+                }
+
+                // Handle element pointing if the response included coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
@@ -635,7 +772,7 @@ final class CompanionManager: ObservableObject {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
+                // Pick the screen capture matching the model's screen number,
                 // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
                     if let screenNumber = parseResult.screenNumber,
@@ -647,7 +784,7 @@ final class CompanionManager: ObservableObject {
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
+                    // Coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1280x831). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
                     let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
@@ -697,18 +834,14 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
+                // Wait for all queued TTS audio to finish playing before
+                // transitioning to idle.
+                await ttsWaitUntilFinished()
+
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
+                    // If no TTS was sent (empty response), fall back
+                } else {
+                    speakCreditsErrorFallback()
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
@@ -735,7 +868,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            while ttsIsPlaying {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -757,7 +890,7 @@ final class CompanionManager: ObservableObject {
 
     /// Speaks a hardcoded error message using macOS system TTS when API
     /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// OpenAI TTS is down.
     private func speakCreditsErrorFallback() {
         let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
         let synthesizer = NSSpeechSynthesizer()
@@ -777,6 +910,40 @@ final class CompanionManager: ObservableObject {
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
         let screenNumber: Int?
+    }
+
+    /// Splits text into complete sentences by looking for sentence-ending
+    /// punctuation (. ! ?) followed by a space or end-of-string. Returns an
+    /// array of sentences including their trailing punctuation. Incomplete
+    /// trailing text (no sentence ender yet) is NOT included — the caller
+    /// handles it separately once the stream finishes.
+    static func extractCompleteSentences(from text: String) -> [String] {
+        var sentences: [String] = []
+        var searchStartIndex = text.startIndex
+
+        while searchStartIndex < text.endIndex {
+            let remaining = text[searchStartIndex...]
+
+            // Find the next sentence-ending punctuation followed by a space
+            // (or end of string). This avoids splitting on abbreviations like
+            // "e.g." or decimal numbers like "3.5".
+            guard let punctuationRange = remaining.range(
+                of: #"[.!?](?:\s|$)"#,
+                options: .regularExpression
+            ) else {
+                break
+            }
+
+            // The sentence runs from searchStartIndex through the punctuation character
+            let sentenceEndIndex = text.index(after: punctuationRange.lowerBound)
+            let sentence = String(text[searchStartIndex..<sentenceEndIndex])
+            sentences.append(sentence)
+
+            // Skip past the punctuation + whitespace for the next sentence
+            searchStartIndex = punctuationRange.upperBound
+        }
+
+        return sentences
     }
 
     /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
